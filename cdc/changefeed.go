@@ -93,6 +93,7 @@ type changeFeed struct {
 	taskPositions    map[model.CaptureID]*model.TaskPosition
 	filter           *filter.Filter
 	sink             sink.Sink
+	syncPointSink    sink.Sink
 	scheduler        scheduler.Scheduler
 
 	cyclicEnabled bool
@@ -909,7 +910,7 @@ func (c *changeFeed) startSyncPeriod(ctx context.Context, interval time.Duration
 
 //createSynctable create a sync table to record the
 func (c *changeFeed) createSynctable(ctx context.Context) error {
-	database := "TiCDC"
+	/*database := "TiCDC"
 	tx, err := c.syncDB.BeginTx(ctx, nil)
 	if err != nil {
 		log.Info("create sync table: begin Tx fail")
@@ -940,7 +941,29 @@ func (c *changeFeed) createSynctable(ctx context.Context) error {
 		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
 	}
 	err = tx.Commit()
-	return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	return cerror.WrapError(cerror.ErrMySQLTxnError, err)*/
+	database := "TiCDC"
+	tableInfo := &model.SimpleTableInfo{
+		Schema: "TiCDC",
+		Table:  "syncpoint",
+	}
+	ddlEvent := new(model.DDLEvent)
+	ddlEvent.TableInfo = tableInfo
+	ddlEvent.Type = timodel.ActionCreateSchema
+	ddlEvent.Query = "CREATE DATABASE IF NOT EXISTS " + database
+	err := c.syncPointSink.EmitDDLEvent(ctx, ddlEvent)
+	if err != nil {
+		log.Error("Execute DDL failed with create schema for syncpoint")
+		return cerror.ErrExecDDLFailed.GenWithStackByArgs()
+	}
+	ddlEvent.Type = timodel.ActionCreateTable
+	ddlEvent.Query = "CREATE TABLE  IF NOT EXISTS syncpoint (cf varchar(255),primary_ts varchar(18),secondary_ts varchar(18),PRIMARY KEY ( `cf`, `primary_ts` ) )"
+	err = c.syncPointSink.EmitDDLEvent(ctx, ddlEvent)
+	if err != nil {
+		log.Error("Execute DDL failed with create schema for syncpoint")
+		return cerror.ErrExecDDLFailed.GenWithStackByArgs()
+	}
+	return nil
 }
 
 //sinkSyncpoint record the syncpoint(a map with ts) in downstream db

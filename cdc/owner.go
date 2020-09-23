@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -357,6 +358,24 @@ func (o *Owner) newChangeFeed(
 		log.Error("error on running owner", zap.Error(err))
 	}
 
+	var syncPointSink sink.Sink
+	if info.SyncPointEnabled {
+		sinkURI, err := url.Parse(info.SinkURI)
+		if err != nil {
+			return nil, errors.Annotatef(err, "parse sinkURI failed")
+		}
+		scheme := strings.ToLower(sinkURI.Scheme)
+		if scheme != "mysql" && scheme != "tidb" && scheme != "mysql+ssl" && scheme != "tidb+ssl" {
+			return nil, errors.New("cann't create mysql sink with unsupported scheme when syncpoint ENABLE")
+		}
+		syncPointSink, err = sink.NewSink(ctx, id, info.SinkURI, filter, info.Config, info.Opts, errCh)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	} else {
+		syncPointSink = nil
+	}
+
 	syncDB, err := sink.NewSyncpointSinklink(ctx, info, id)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -390,6 +409,7 @@ func (o *Owner) newChangeFeed(
 		etcdCli:           o.etcdClient,
 		filter:            filter,
 		sink:              primarySink,
+		syncPointSink:     syncPointSink,
 		cyclicEnabled:     info.Config.Cyclic.IsEnabled(),
 		lastRebalanceTime: time.Now(),
 	}
@@ -541,7 +561,7 @@ func (o *Owner) loadChangeFeeds(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			newCf.startSyncPointTicker(ctx, newCf.info.SyncPointInterval)
+			//newCf.startSyncPointTicker(ctx, newCf.info.SyncPointInterval)
 		} else {
 			log.Info("syncpoint is off", zap.Bool("syncpoint", newCf.info.SyncPointEnabled))
 		}

@@ -368,17 +368,14 @@ func (o *Owner) newChangeFeed(
 		if scheme != "mysql" && scheme != "tidb" && scheme != "mysql+ssl" && scheme != "tidb+ssl" {
 			return nil, errors.New("cann't create mysql sink with unsupported scheme when syncpoint ENABLE")
 		}
-		syncPointSink, err = sink.NewSink(ctx, id, info.SinkURI, filter, info.Config, info.Opts, errCh)
+		syncPointOpts := info.Opts
+		syncPointOpts[sink.SyncPointEnable] = "true"
+		syncPointSink, err = sink.NewSink(ctx, id, info.SinkURI, filter, info.Config, syncPointOpts, errCh)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 	} else {
 		syncPointSink = nil
-	}
-
-	syncDB, err := sink.NewSyncpointSinklink(ctx, info, id)
-	if err != nil {
-		return nil, errors.Trace(err)
 	}
 
 	cf = &changeFeed{
@@ -402,7 +399,6 @@ func (o *Owner) newChangeFeed(
 		ddlTs:             0,
 		updateResolvedTs:  true,
 		startTimer:        make(chan bool),
-		syncDB:            syncDB,
 		syncCancel:        nil,
 		taskStatus:        processorsInfos,
 		taskPositions:     taskPositions,
@@ -561,7 +557,7 @@ func (o *Owner) loadChangeFeeds(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			//newCf.startSyncPointTicker(ctx, newCf.info.SyncPointInterval)
+			newCf.startSyncPointTicker(ctx, newCf.info.SyncPointInterval)
 		} else {
 			log.Info("syncpoint is off", zap.Bool("syncpoint", newCf.info.SyncPointEnabled))
 		}

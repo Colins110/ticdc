@@ -63,6 +63,12 @@ const (
 	defaultBatchReplaceSize    = 20
 	defaultReadTimeout         = "2m"
 	defaultWriteTimeout        = "2m"
+
+	SyncPointEnable = "syncpointEnable"
+
+	SyncPointColumnCf    = "cf"
+	SyncPointColumnPriTs = "primary_ts"
+	SyncPointColumnSecTs = "secondary_ts"
 )
 
 var (
@@ -94,6 +100,8 @@ type mysqlSink struct {
 	// metrics used by mysql sink only
 	metricConflictDetectDurationHis prometheus.Observer
 	metricBucketSizeCounters        []prometheus.Counter
+
+	syncPointEnabled bool
 }
 
 func (s *mysqlSink) EmitRowChangedEvents(ctx context.Context, rows ...*model.RowChangedEvent) error {
@@ -497,6 +505,13 @@ func newMySQLSink(ctx context.Context, changefeedID model.ChangeFeedID, sinkURI 
 		metricConflictDetectDurationHis: metricConflictDetectDurationHis,
 		metricBucketSizeCounters:        metricBucketSizeCounters,
 		errCh:                           make(chan error, 1),
+		syncPointEnabled:                false,
+	}
+
+	if syncpointEnable, ok := opts[SyncPointEnable]; ok {
+		if syncpointEnable == "true" {
+			sink.syncPointEnabled = true
+		}
 	}
 
 	if val, ok := opts[mark.OptCyclicConfig]; ok {
@@ -737,6 +752,20 @@ func (s *mysqlSink) execDMLWithMaxRetries(
 				}
 				for i, query := range dmls.sqls {
 					args := dmls.values[i]
+					if s.syncPointEnabled {
+						row := tx.QueryRowContext(ctx, "select @@tidb_current_ts")
+						var secondaryTs string
+						err = row.Scan(&secondaryTs)
+						if err != nil {
+							log.Info("sync table: get tidb_current_ts err")
+							return 0, checkTxnErr(cerror.WrapError(cerror.ErrMySQLTxnError, err))
+						}
+						for i, arg := range args {
+							if arg == SyncPointColumnSecTs {
+								args[i] = secondaryTs
+							}
+						}
+					}
 					log.Debug("exec row", zap.String("sql", query), zap.Any("args", args))
 					if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 						return 0, checkTxnErr(cerror.WrapError(cerror.ErrMySQLTxnError, err))
@@ -1004,93 +1033,4 @@ func buildColumnList(names []string) string {
 	}
 
 	return b.String()
-}
-
-//NewSyncpointSinklink create a sink to record the syncpoint map in downstream DB for every changefeed
-func NewSyncpointSinklink(ctx context.Context, info *model.ChangeFeedInfo, id string) (*sql.DB, error) {
-	var syncDB *sql.DB
-	// parse sinkURI as a URI
-	sinkURI, err := url.Parse(info.SinkURI)
-	if err != nil {
-		return nil, errors.Annotatef(err, "parse sinkURI failed")
-	}
-	//todo If is neither mysql nor tidb, such as kafka, just ignore this feature.
-	scheme := strings.ToLower(sinkURI.Scheme)
-	if scheme != "mysql" && scheme != "tidb" && scheme != "mysql+ssl" && scheme != "tidb+ssl" {
-		return nil, errors.New("can create mysql sink with unsupported scheme")
-	}
-	params := defaultParams
-	s := sinkURI.Query().Get("tidb-txn-mode")
-	if s != "" {
-		if s == "pessimistic" || s == "optimistic" {
-			params.tidbTxnMode = s
-		} else {
-			log.Warn("invalid tidb-txn-mode, should be pessimistic or optimistic, use optimistic as default")
-		}
-	}
-	var tlsParam string
-	if sinkURI.Query().Get("ssl-ca") != "" {
-		credential := security.Credential{
-			CAPath:   sinkURI.Query().Get("ssl-ca"),
-			CertPath: sinkURI.Query().Get("ssl-cert"),
-			KeyPath:  sinkURI.Query().Get("ssl-key"),
-		}
-		tlsCfg, err := credential.ToTLSConfig()
-		if err != nil {
-			return nil, errors.Annotate(err, "fail to open MySQL connection")
-		}
-		name := "cdc_mysql_tls" + "syncpoint" + id
-		err = dmysql.RegisterTLSConfig(name, tlsCfg)
-		if err != nil {
-			return nil, errors.Annotate(err, "fail to open MySQL connection")
-		}
-		tlsParam = "?tls=" + name
-	}
-
-	// dsn format of the driver:
-	// [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
-	username := sinkURI.User.Username()
-	password, _ := sinkURI.User.Password()
-	port := sinkURI.Port()
-	if username == "" {
-		username = "root"
-	}
-	if port == "" {
-		port = "4000"
-	}
-
-	dsnStr := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", username, password, sinkURI.Hostname(), port, tlsParam)
-	dsn, err := dmysql.ParseDSN(dsnStr)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	tz := util.TimezoneFromCtx(ctx)
-	// create test db used for parameter detection
-	if dsn.Params == nil {
-		dsn.Params = make(map[string]string, 1)
-	}
-	dsn.Params["time_zone"] = fmt.Sprintf(`"%s"`, tz.String())
-	testDB, err := sql.Open("mysql", dsn.FormatDSN())
-	if err != nil {
-		return nil, errors.Annotate(
-			cerror.WrapError(cerror.ErrMySQLConnectionError, err), "fail to open MySQL connection when configuring sink")
-	}
-	defer testDB.Close()
-	dsnStr, err = configureSinkURI(ctx, dsn, tz, params, testDB)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	syncDB, err = sql.Open("mysql", dsnStr)
-	if err != nil {
-		return nil, errors.Annotate(err, "Open database connection failed")
-	}
-	err = syncDB.PingContext(ctx)
-	if err != nil {
-		return nil, errors.Annotatef(err, "fail to open MySQL connection")
-	}
-
-	log.Info("Start mysql syncpoint sink")
-
-	return syncDB, nil
 }

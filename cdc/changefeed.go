@@ -994,9 +994,11 @@ func (c *changeFeed) Close() {
 	if err != nil {
 		log.Warn("failed to close owner sink", zap.Error(err))
 	}
-	err = c.syncPointSink.Close()
-	if err != nil {
-		log.Warn("failed to close syncpoint sink", zap.Error(err))
+	if c.syncPointSink != nil {
+		err = c.syncPointSink.Close()
+		if err != nil {
+			log.Warn("failed to close syncpoint sink", zap.Error(err))
+		}
 	}
 	log.Info("changefeed closed", zap.String("id", c.id))
 }

@@ -15,7 +15,6 @@ package cdc
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"math"
 	"sync"
@@ -35,6 +34,11 @@ import (
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"go.etcd.io/etcd/mvcc/mvccpb"
 	"go.uber.org/zap"
+)
+
+const (
+	syncpointSchema = "TiCDC"
+	syncpointTable  = "syncpoint"
 )
 
 type tableIDMap = map[model.TableID]struct{}
@@ -87,12 +91,12 @@ type changeFeed struct {
 	syncpointMutex   sync.Mutex
 	updateResolvedTs bool
 	startTimer       chan bool
-	syncDB           *sql.DB
 	syncCancel       context.CancelFunc
 	taskStatus       model.ProcessorsInfos
 	taskPositions    map[model.CaptureID]*model.TaskPosition
 	filter           *filter.Filter
 	sink             sink.Sink
+	syncPointSink    sink.Sink
 	scheduler        scheduler.Scheduler
 
 	cyclicEnabled bool
@@ -909,68 +913,63 @@ func (c *changeFeed) startSyncPeriod(ctx context.Context, interval time.Duration
 
 //createSynctable create a sync table to record the
 func (c *changeFeed) createSynctable(ctx context.Context) error {
-	database := "TiCDC"
-	tx, err := c.syncDB.BeginTx(ctx, nil)
-	if err != nil {
-		log.Info("create sync table: begin Tx fail")
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	tableInfo := &model.SimpleTableInfo{
+		Schema: syncpointSchema,
+		Table:  syncpointTable,
 	}
-	_, err = tx.Exec("CREATE DATABASE IF NOT EXISTS " + database)
+	ddlEvent := new(model.DDLEvent)
+	ddlEvent.TableInfo = tableInfo
+	ddlEvent.Type = timodel.ActionCreateSchema
+	ddlEvent.Query = "CREATE DATABASE IF NOT EXISTS " + syncpointSchema
+	err := c.syncPointSink.EmitDDLEvent(ctx, ddlEvent)
 	if err != nil {
-		err2 := tx.Rollback()
-		if err2 != nil {
-			log.Error(cerror.WrapError(cerror.ErrMySQLTxnError, err2).Error())
-		}
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+		log.Error("Execute DDL failed with create schema for syncpoint")
+		return cerror.ErrExecDDLFailed.GenWithStackByArgs()
 	}
-	_, err = tx.Exec("USE " + database)
+	ddlEvent.Type = timodel.ActionCreateTable
+	ddlEvent.Query = "CREATE TABLE  IF NOT EXISTS syncpoint (cf varchar(255),primary_ts varchar(18),secondary_ts varchar(18),PRIMARY KEY ( `cf`, `primary_ts` ) )"
+	err = c.syncPointSink.EmitDDLEvent(ctx, ddlEvent)
 	if err != nil {
-		err2 := tx.Rollback()
-		if err2 != nil {
-			log.Error(cerror.WrapError(cerror.ErrMySQLTxnError, err2).Error())
-		}
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+		log.Error("Execute DDL failed with create schema for syncpoint")
+		return cerror.ErrExecDDLFailed.GenWithStackByArgs()
 	}
-	_, err = tx.Exec("CREATE TABLE  IF NOT EXISTS syncpoint (cf varchar(255),primary_ts varchar(18),secondary_ts varchar(18),PRIMARY KEY ( `cf`, `primary_ts` ) )")
-	if err != nil {
-		err2 := tx.Rollback()
-		if err2 != nil {
-			log.Error(cerror.WrapError(cerror.ErrMySQLTxnError, err2).Error())
-		}
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
-	}
-	err = tx.Commit()
-	return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	return nil
 }
 
 //sinkSyncpoint record the syncpoint(a map with ts) in downstream db
 func (c *changeFeed) sinkSyncpoint(ctx context.Context) error {
-	tx, err := c.syncDB.BeginTx(ctx, nil)
-	if err != nil {
-		log.Info("sync table: begin Tx fail")
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	syncPointTs := c.status.CheckpointTs
+	rows := make([]*model.RowChangedEvent, 0, 1)
+	table := &model.TableName{
+		Schema: syncpointSchema,
+		Table:  syncpointTable,
 	}
-	row := tx.QueryRow("select @@tidb_current_ts")
-	var secondaryTs string
-	err = row.Scan(&secondaryTs)
-	if err != nil {
-		log.Info("sync table: get tidb_current_ts err")
-		err2 := tx.Rollback()
-		if err2 != nil {
-			log.Error(cerror.WrapError(cerror.ErrMySQLTxnError, err2).Error())
-		}
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	columns := make([]*model.Column, 0, 3)
+	columnCf := &model.Column{
+		Name:  sink.SyncPointColumnCf,
+		Value: c.id,
 	}
-	_, err = tx.Exec("insert into TiCDC.syncpoint(cf, primary_ts, secondary_ts) VALUES (?,?,?)", c.id, c.status.CheckpointTs, secondaryTs)
-	if err != nil {
-		err2 := tx.Rollback()
-		if err2 != nil {
-			log.Error(cerror.WrapError(cerror.ErrMySQLTxnError, err2).Error())
-		}
-		return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	columnPriTs := &model.Column{
+		Name:  sink.SyncPointColumnPriTs,
+		Value: syncPointTs,
 	}
-	err = tx.Commit()
-	return cerror.WrapError(cerror.ErrMySQLTxnError, err)
+	columnSecTs := &model.Column{
+		Name:  sink.SyncPointColumnSecTs,
+		Value: sink.SyncPointColumnSecTs, //secondary_ts's real value will be set when begin the transaction to sink this record
+	}
+	columns = append(columns, columnCf, columnPriTs, columnSecTs)
+	row := &model.RowChangedEvent{
+		StartTs:  syncPointTs,
+		CommitTs: syncPointTs,
+		Table:    table,
+		Columns:  columns,
+	}
+	rows = append(rows, row)
+	err := c.syncPointSink.EmitRowChangedEvents(ctx, rows...)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	return nil
 }
 
 func (c *changeFeed) stopSyncPointTicker() {
@@ -994,6 +993,10 @@ func (c *changeFeed) Close() {
 	err = c.sink.Close()
 	if err != nil {
 		log.Warn("failed to close owner sink", zap.Error(err))
+	}
+	err = c.syncPointSink.Close()
+	if err != nil {
+		log.Warn("failed to close syncpoint sink", zap.Error(err))
 	}
 	log.Info("changefeed closed", zap.String("id", c.id))
 }

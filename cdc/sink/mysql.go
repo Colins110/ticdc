@@ -62,14 +62,17 @@ const (
 	defaultBatchReplaceSize    = 20
 	defaultReadTimeout         = "2m"
 	defaultWriteTimeout        = "2m"
-
+	//SyncPointEnable means the MySQLsink is(or not) a sink for syncpoint record
 	SyncPointEnable = "syncpointEnable"
 
-	SyncPointColumnCf    = "cf"
+	//SyncPointColumnCf is the name of Column in syncpoint table
+	SyncPointColumnCf = "cf"
+	//SyncPointColumnPriTs is the name of Column in syncpoint table
 	SyncPointColumnPriTs = "primary_ts"
+	//SyncPointColumnSecTs is the name of Column in syncpoint table
 	SyncPointColumnSecTs = "secondary_ts"
 
-	defaultSafeMode            = true
+	defaultSafeMode = true
 )
 
 var (

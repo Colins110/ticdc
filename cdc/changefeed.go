@@ -959,16 +959,13 @@ func (c *changeFeed) sinkSyncpoint(ctx context.Context) error {
 	}
 	columns = append(columns, columnCf, columnPriTs, columnSecTs)
 	row := &model.RowChangedEvent{
+		StartTs:  syncPointTs,
 		CommitTs: syncPointTs,
 		Table:    table,
 		Columns:  columns,
 	}
 	rows = append(rows, row)
 	err := c.syncPointSink.EmitRowChangedEvents(ctx, rows...)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	_, err = c.syncPointSink.FlushRowChangedEvents(ctx, syncPointTs)
 	if err != nil {
 		return errors.Trace(err)
 	}

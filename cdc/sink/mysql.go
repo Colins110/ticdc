@@ -105,8 +105,16 @@ type mysqlSink struct {
 }
 
 func (s *mysqlSink) EmitRowChangedEvents(ctx context.Context, rows ...*model.RowChangedEvent) error {
-	count := s.txnCache.Append(s.filter, rows...)
-	s.statistics.AddRowsCount(count)
+	// syncpointEnable means we should sink the syncpoint record synchronously
+	if s.syncPointEnabled {
+		err := s.execDMLs(ctx, rows, 0, 0)
+		if err != nil {
+			return err
+		}
+	} else {
+		count := s.txnCache.Append(s.filter, rows...)
+		s.statistics.AddRowsCount(count)
+	}
 	return nil
 }
 

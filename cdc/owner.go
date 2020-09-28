@@ -368,7 +368,10 @@ func (o *Owner) newChangeFeed(
 		if scheme != "mysql" && scheme != "tidb" && scheme != "mysql+ssl" && scheme != "tidb+ssl" {
 			return nil, errors.New("cann't create mysql sink with unsupported scheme when syncpoint ENABLE")
 		}
-		syncPointOpts := info.Opts
+		syncPointOpts := make(map[string]string)
+		for opt, val := range info.Opts {
+			syncPointOpts[opt] = val
+		}
 		syncPointOpts[sink.SyncPointEnable] = "true"
 		syncPointSink, err = sink.NewSink(ctx, id, info.SinkURI, filter, info.Config, syncPointOpts, errCh)
 		if err != nil {
